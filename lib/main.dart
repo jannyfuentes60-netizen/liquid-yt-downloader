@@ -13,14 +13,88 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'models.dart';
 import 'yt_service.dart';
 
+/// Escribe un error de arranque en Descargas/LiquidYT/crash.log (si se
+/// puede) y, si no, en la carpeta privada de la app. Best effort: nunca tira.
+Future<void> _writeCrashLog(String text) async {
+  final line = '[${DateTime.now().toIso8601String()}] $text\n';
+  try {
+    final dir = Directory('/storage/emulated/0/Download/LiquidYT');
+    await dir.create(recursive: true);
+    await File('${dir.path}/crash.log')
+        .writeAsString(line, mode: FileMode.append);
+    return;
+  } catch (_) {}
+  try {
+    final docs = await getApplicationDocumentsDirectory();
+    await File('${docs.path}/crash.log')
+        .writeAsString(line, mode: FileMode.append);
+  } catch (_) {}
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await LiquidGlassWidgets.initialize();
-  runApp(LiquidGlassWidgets.wrap(
-    brightnessResolver: Theme.maybeBrightnessOf,
-    theme: const GlassThemeData.ios27(),
-    child: const LiquidYtApp(),
-  ));
+
+  // Si un widget falla al dibujar, mostrar un mensaje legible en vez de
+  // una pantalla negra / cierre silencioso.
+  ErrorWidget.builder = (details) => Material(
+        color: const Color(0xFF0B1026),
+        child: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Text(
+              'Algo falló al dibujar la pantalla.\n${details.exception}',
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.white),
+            ),
+          ),
+        ),
+      );
+
+  FlutterError.onError = (details) {
+    unawaited(_writeCrashLog(
+        'flutter-error: ${details.exception}\n${details.stack}'));
+    FlutterError.presentError(details);
+  };
+  // Errores async sin atrapar: guardarlos y NO matar el isolate.
+  WidgetsBinding.instance.platformDispatcher.onError = (error, stack) {
+    unawaited(_writeCrashLog('uncaught-async: $error\n$stack'));
+    return true;
+  };
+
+  // El precache de shaders del glass no debe matar la app si falla.
+  // warmUpMode.never: sin precarga pesada antes del primer frame; los
+  // shaders se cargan bajo demanda al pintar. En un gama baja con GLES
+  // (Galaxy A07) el warm-up pesado puede colgar el arranque.
+  bool glassOk = false;
+  try {
+    await LiquidGlassWidgets.initialize(
+      warmUpMode: GlassWarmUpMode.never,
+    ).timeout(const Duration(seconds: 10));
+    glassOk = true;
+  } catch (e, st) {
+    await _writeCrashLog('glass-init falló: $e\n$st');
+    glassOk = false;
+  }
+
+  runZonedGuarded(
+    () {
+      runApp(
+        glassOk
+            ? LiquidGlassWidgets.wrap(
+                brightnessResolver: Theme.maybeBrightnessOf,
+                theme: const GlassThemeData.ios27(),
+                // En Android gama baja: arrancar en calidad estándar y
+                // dejar que el paquete suba/baje según el GPU real.
+                adaptiveQuality: true,
+                child: const LiquidYtApp(),
+              )
+            : const LiquidYtApp(),
+      );
+    },
+    (error, stack) {
+      unawaited(_writeCrashLog('uncaught-zone: $error\n$stack'));
+    },
+  );
 }
 
 class LiquidYtApp extends StatelessWidget {
@@ -60,9 +134,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   int _tabIndex = 0;
   bool _engineReady = false;
-  bool _engineBusy = true;
+  // El motor ya NO se inicia en el arranque: se prepara perezosamente al
+  // primer uso (resolver/descargar). Así abrir la app nunca depende de la
+  // extracción pesada de yt-dlp/FFmpeg en el hilo principal.
+  bool _engineBusy = false;
+  Future<bool>? _engineInitFuture;
   String? _engineError;
   String _engineVersions = '';
+  String? _crashLogPath;
 
   bool _searching = false;
   bool _resolving = false;
@@ -90,7 +169,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       }
       return null;
     });
-    _boot();
+    // Arranque DESPUÉS del primer frame: la UI ya pintó antes de pedir
+    // permisos, leer el historial o tocar el motor. Nada de esto puede
+    // impedir que la app se abra.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _boot());
   }
 
   @override
@@ -108,23 +190,105 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _boot() async {
-    await Permission.storage.request();
-    await _loadHistory();
-    await _refreshOutputDirLabel();
-    final ok = await _yt.init();
-    if (!mounted) return;
+    // Cada paso va en su propio try/catch: si uno falla, se registra y se
+    // sigue con los demás. Un error aquí ya no puede cerrar la app.
+    try {
+      try {
+        await Permission.storage.request().timeout(
+              const Duration(seconds: 5),
+              onTimeout: () => PermissionStatus.denied,
+            );
+      } catch (e, st) {
+        unawaited(_writeCrashLog('permiso storage falló: $e\n$st'));
+      }
+      try {
+        await _loadHistory();
+      } catch (e, st) {
+        unawaited(_writeCrashLog('historial falló: $e\n$st'));
+      }
+      try {
+        await _refreshOutputDirLabel();
+      } catch (e, st) {
+        unawaited(_writeCrashLog('carpeta salida falló: $e\n$st'));
+      }
+      await _checkCrashLog();
+    } catch (e, st) {
+      unawaited(_writeCrashLog('boot falló: $e\n$st'));
+      if (mounted) {
+        setState(() {
+          _engineBusy = false;
+          _engineError = 'Falló el arranque: $e';
+        });
+      }
+    }
+    _listenToDownloads();
+    await _checkSharedText();
+  }
+
+  /// Prepara el motor yt-dlp la primera vez que hace falta (resolver o
+  /// descargar). Nunca se llama en el arranque. Una sola inicialización
+  /// en vuelo: los demás esperan el mismo Future. Con timeout para no
+  /// dejar la UI colgada si la extracción nativa se atora.
+  Future<bool> _ensureEngine() async {
+    if (_engineReady) return true;
+    final inFlight = _engineInitFuture;
+    if (inFlight != null) return inFlight;
+    final fut = _initEngine();
+    _engineInitFuture = fut;
+    final ok = await fut;
+    if (!ok) _engineInitFuture = null; // permitir reintentar
+    return ok;
+  }
+
+  Future<bool> _initEngine() async {
+    if (!mounted) return false;
+    setState(() {
+      _engineBusy = true;
+      _engineError = null;
+    });
+    bool ok = false;
+    try {
+      ok = await _yt
+          .init()
+          .timeout(const Duration(seconds: 60), onTimeout: () => false);
+    } catch (e, st) {
+      unawaited(_writeCrashLog('init motor falló: $e\n$st'));
+      ok = false;
+    }
+    if (!mounted) return ok;
     setState(() {
       _engineReady = ok;
       _engineBusy = false;
-      _engineError = ok ? null : _yt.engineError;
+      _engineError =
+          ok ? null : (_yt.engineError ?? 'No se pudo iniciar yt-dlp');
     });
     if (ok) {
-      _engineVersions = await _yt.engineVersions();
-      if (mounted) setState(() {});
+      try {
+        _engineVersions = await _yt.engineVersions();
+        if (mounted) setState(() {});
+      } catch (_) {}
       unawaited(_yt.updateEngine());
     }
-    _listenToDownloads();
-    _checkSharedText();
+    return ok;
+  }
+
+  /// Si existe un crash.log de un arranque anterior, recordar su ruta
+  /// para mostrarla en la pestaña Descargas.
+  Future<void> _checkCrashLog() async {
+    const publicPath = '/storage/emulated/0/Download/LiquidYT/crash.log';
+    try {
+      if (await File(publicPath).exists()) {
+        if (mounted) setState(() => _crashLogPath = publicPath);
+        return;
+      }
+    } catch (_) {}
+    try {
+      final docs = await getApplicationDocumentsDirectory();
+      final p = '${docs.path}/crash.log';
+      if (await File(p).exists()) {
+        if (mounted) setState(() => _crashLogPath = p);
+      }
+    } catch (_) {}
   }
 
   void _listenToDownloads() {
@@ -180,8 +344,20 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     } catch (_) {
       // Android no dejó escribir ahí: se usa el almacenamiento de la app.
     }
-    final ext = await getExternalStorageDirectory();
-    final dir = Directory('${ext!.path}/LiquidYT');
+    // 2) Carpeta externa de la app. getExternalStorageDirectory() PUEDE
+    // devolver null (sin almacenamiento externo): antes había un `ext!`
+    // que cerraba la app en ese caso. Ahora se comprueba y se cae a la
+    // carpeta de documentos de la app, que siempre existe.
+    try {
+      final ext = await getExternalStorageDirectory();
+      if (ext != null) {
+        final dir = Directory('${ext.path}/LiquidYT');
+        await dir.create(recursive: true);
+        return dir;
+      }
+    } catch (_) {}
+    final docs = await getApplicationDocumentsDirectory();
+    final dir = Directory('${docs.path}/LiquidYT');
     await dir.create(recursive: true);
     return dir;
   }
@@ -268,8 +444,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _resolveAndShow(String url) async {
-    if (!_engineReady) {
-      _snack('El motor yt-dlp aún se está preparando…');
+    // El motor se prepara aquí, perezosamente, no en el arranque.
+    final ready = await _ensureEngine();
+    if (!ready) {
+      if (mounted) {
+        _snack('No se pudo preparar el motor yt-dlp. Inténtalo de nuevo.');
+      }
       return;
     }
     setState(() {
@@ -299,6 +479,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     if (_activeProcessId != null) {
       _snack('Ya hay una descarga en curso, espera a que termine');
       return;
+    }
+    if (!_engineReady) {
+      final ready = await _ensureEngine();
+      if (!ready) {
+        _snack('Motor no listo: no se pudo preparar yt-dlp.');
+        return;
+      }
     }
     final dir = await _outputDir();
     final processId = 'dl_${DateTime.now().millisecondsSinceEpoch}';
@@ -453,7 +640,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                           ? 'Preparando yt-dlp en tu teléfono…'
                           : _engineReady
                               ? 'Motor listo · descarga en tu teléfono'
-                              : 'Motor no listo',
+                              : 'Motor no listo · se prepara al buscar o descargar',
                       style: const TextStyle(fontWeight: FontWeight.w600),
                     ),
                   ),
@@ -769,6 +956,32 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           ),
         ),
         const SizedBox(height: 12),
+        if (_crashLogPath != null)
+          _glassCard(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Row(
+                  children: [
+                    Icon(Icons.warning_amber, color: Colors.orangeAccent),
+                    SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'Se guardó un registro de un error anterior',
+                        style: TextStyle(fontWeight: FontWeight.w700),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'Si la app se vuelve a cerrar, mándame este archivo:\n$_crashLogPath',
+                  style: TextStyle(color: Colors.white.withOpacity(0.75)),
+                ),
+              ],
+            ),
+          ),
+        if (_crashLogPath != null) const SizedBox(height: 12),
         if (_history.isEmpty)
           _glassCard(
             child: const Column(
