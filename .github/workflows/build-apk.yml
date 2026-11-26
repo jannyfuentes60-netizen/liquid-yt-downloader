@@ -1,0 +1,77 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter 3.47.9 (stable)
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.9"
+          channel: stable
+          cache: true
+
+      - name: Flutter version
+        run: flutter --version
+
+      - name: Regenerate Android scaffold with this Flutter version
+        run: |
+          set -e
+          mkdir -p /tmp/keep
+          cp android/app/src/main/AndroidManifest.xml /tmp/keep/AndroidManifest.xml
+          cp android/app/src/main/kotlin/com/linejaque/liquidyt/MainActivity.kt /tmp/keep/MainActivity.kt
+          cp android/app/build.gradle.kts /tmp/keep/app-build.gradle.kts
+          flutter create --org com.linejaque --project-name liquid_yt --platforms android /tmp/liquidyt-scaffold
+          rm -rf android
+          cp -r /tmp/liquidyt-scaffold/android ./android
+          cp /tmp/keep/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+          mkdir -p android/app/src/main/kotlin/com/linejaque/liquidyt
+          cp /tmp/keep/MainActivity.kt android/app/src/main/kotlin/com/linejaque/liquidyt/MainActivity.kt
+          cp /tmp/keep/app-build.gradle.kts android/app/build.gradle.kts
+          rm -rf android/app/src/main/kotlin/com/linejaque/liquid_yt
+          grep -q "minSdk = 24" android/app/build.gradle.kts
+          grep -q "android.intent.action.SEND" android/app/src/main/AndroidManifest.xml
+          grep -q "extractNativeLibs" android/app/src/main/AndroidManifest.xml
+
+      - name: Pub get
+        run: flutter pub get
+
+      - name: Build APK (split per ABI)
+        run: flutter build apk --release --split-per-abi
+
+      - name: List APKs
+        run: ls -lh build/app/outputs/flutter-apk/
+
+      - name: Upload APKs as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: liquid-yt-apks
+          path: build/app/outputs/flutter-apk/*.apk
+
+      - name: Create Release with arm64 APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Liquid YT v1.0.${{ github.run_number }}
+          body: |
+            Liquid YT — Descargador de YouTube para Android.
+            Instala el APK `app-arm64-v8a-release.apk` (Galaxy A07 y casi todos los Android actuales).
+            yt-dlp + FFmpeg van dentro de la app: la descarga se hace desde tu teléfono, no desde un servidor.
+          files: build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
