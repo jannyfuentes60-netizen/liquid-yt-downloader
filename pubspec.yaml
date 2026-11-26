@@ -1,0 +1,30 @@
+name: liquid_yt
+description: "Liquid YT — Descargador de YouTube para Android con estilo iOS 27 Liquid Glass. yt-dlp + FFmpeg en el dispositivo, sin servidor."
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.5.0 <4.0.0"
+  flutter: ">=3.41.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # iOS 27 Liquid Glass (GlassStyle.ios27 por defecto, Flutter >= 3.41).
+  liquid_glass_widgets: ^1.21.0
+  # yt-dlp + FFmpeg en el dispositivo (Android: youtubedl-android, Python + FFmpeg
+  # incluidos en el APK). Lista formatos reales y descarga video/audio con FFmpeg.
+  extractor: ^1.0.0
+  # Solo para la búsqueda por texto (sin API key). La descarga siempre es yt-dlp.
+  youtube_explode_dart: ^2.5.3
+  path_provider: ^2.1.0
+  permission_handler: ^11.0.0
+  shared_preferences: ^2.0.0
+  open_file: ^3.3.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
