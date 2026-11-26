@@ -8,8 +8,16 @@
     <application
         android:label="Liquid YT"
         android:name="${applicationName}"
-        android:icon="@android:drawable/sym_def_app_icon"
-        android:extractNativeLibs="true">
+        android:icon="@android:drawable/sym_def_app_icon">
+        <!-- NOTE: android:extractNativeLibs must NOT be set here.
+             AGP 9 fails :app:packageRelease when it is set to "true" in
+             the Manifest. Extraction is preserved via the DSL instead:
+             packagingOptions.jniLibs.useLegacyPackaging = true in
+             android/app/build.gradle.kts (the documented AGP replacement
+             for extractNativeLibs=true). The extractor / youtubedl-android
+             plugin REQUIRES extraction: its libpython.zip.so,
+             libffmpeg.zip.so and libaria2c.zip.so must exist as files on
+             disk at runtime so the plugin can unzip and execute them. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
