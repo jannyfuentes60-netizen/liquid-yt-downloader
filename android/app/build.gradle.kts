@@ -4,6 +4,9 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+// Keystore debug fijo instalado por el workflow ("Use fixed debug keystore").
+val fixedDebugKeystore = rootProject.file("${System.getProperty("user.home")}/.android/debug.keystore")
+
 android {
     namespace = "com.linejaque.liquidyt"
     compileSdk = flutter.compileSdkVersion
@@ -44,11 +47,22 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            // Firma fija: el workflow instala siempre el mismo debug.keystore
+            // en ~/.android/debug.keystore (paso "Use fixed debug keystore").
+            // Apuntado explícito para no depender del signingConfig debug
+            // por defecto de AGP, que en el run #11 no usó ese archivo.
+            storeFile = fixedDebugKeystore
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("release")
             // NOTE: do NOT set isExtractNativeLibs = false here.
             // AGP 9's packageRelease error suggests moving the manifest
             // setting into the build type, but false would mean the .so
