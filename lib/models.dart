@@ -31,6 +31,11 @@ class SearchItem {
 }
 
 /// Una opción de formato/calidad para descargar.
+/// - Si [directUrl] NO es null: descarga DIRECTA por HTTP con
+///   youtube_explode, sin tocar el motor nativo yt-dlp (no puede cerrar
+///   la app). Es la vía preferida cuando el manifiesto la trae.
+/// - Si es null: descarga con yt-dlp (motor nativo), solo al presionar
+///   Descargar, nunca al tocar una rola.
 class FormatOption {
   final String id;
   final String label;
@@ -38,6 +43,8 @@ class FormatOption {
   final String formatString;
   final bool audioOnly;
   final String audioFormat;
+  final String? directUrl;
+  final String directExt;
 
   const FormatOption({
     required this.id,
@@ -46,7 +53,11 @@ class FormatOption {
     required this.formatString,
     required this.audioOnly,
     this.audioFormat = '',
+    this.directUrl,
+    this.directExt = '',
   });
+
+  bool get isDirect => directUrl != null && directUrl!.isNotEmpty;
 }
 
 /// Un video resuelto con sus formatos reales (de yt-dlp).
