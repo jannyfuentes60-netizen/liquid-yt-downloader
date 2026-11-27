@@ -74,11 +74,15 @@ class YtService {
 
   /// Resuelve un link de YouTube con yt-dlp: título, canal, duración,
   /// miniatura y la lista REAL de formatos del video.
+  /// OJO: esta llamada corre Python nativo (yt-dlp). Si el proceso nativo
+  /// muere, ningún try/catch de Dart lo atrapa: por eso quien llama debe
+  /// escribir last_action ANTES de llamar y ponerle timeout.
   Future<ResolvedVideo> resolve(String url) async {
     final info = await _dl.getVideoInfo(url);
     final formats = <VideoFormatInfo>[];
     for (final f in info.formats ?? <VideoFormat?>[]) {
       if (f == null || f.formatId == null) continue;
+      if (formats.length >= 200) break; // yt-dlp puede traer cientos
       formats.add(VideoFormatInfo(
         formatId: f.formatId!,
         ext: f.ext ?? '',
@@ -89,15 +93,45 @@ class YtService {
         filesize: f.filesize,
       ));
     }
+    final title = info.title;
     return ResolvedVideo(
       url: url,
-      title: info.title ?? 'Video de YouTube',
+      title: (title != null && title.isNotEmpty) ? title : 'Video de YouTube',
       channel: info.uploader ?? '',
       thumbnailUrl: info.thumbnail ?? '',
       durationSeconds: info.duration,
       viewCount: info.viewCount,
       formats: formats,
     );
+  }
+
+  /// Metadatos ligeros de un video SIN yt-dlp: solo HTTP con
+  /// youtube_explode. No toca código nativo, así que no puede matar la
+  /// app como getVideoInfo. Sirve para pintar la tarjeta al instante y
+  /// dejar los formatos reales para después (en segundo plano).
+  Future<ResolvedVideo> videoMeta(String url) async {
+    final yt = YoutubeExplode();
+    try {
+      final v = await yt.videos.get(url);
+      return ResolvedVideo(
+        url: url,
+        title: v.title,
+        channel: v.author,
+        thumbnailUrl: v.thumbnails.mediumResUrl.toString(),
+        durationSeconds: v.duration?.inSeconds,
+        formats: const [],
+      );
+    } finally {
+      yt.close();
+    }
+  }
+
+  /// Saca el ID de 11 caracteres de cualquier link de YouTube.
+  static String? videoIdFromUrl(String url) {
+    final m = RegExp(
+      r'(?:v=|/shorts/|/embed/|/live/|youtu\.be/)([A-Za-z0-9_-]{11})',
+    ).firstMatch(url);
+    return m?.group(1);
   }
 
   /// Descarga con yt-dlp. [processId] sirve para el progreso y para cancelar.
