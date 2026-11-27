@@ -13,9 +13,14 @@ dependencies:
   # iOS 27 Liquid Glass (GlassStyle.ios27 por defecto, Flutter >= 3.41).
   liquid_glass_widgets: ^1.21.0
   # yt-dlp + FFmpeg en el dispositivo (Android: youtubedl-android, Python + FFmpeg
-  # incluidos en el APK). Lista formatos reales y descarga video/audio con FFmpeg.
-  extractor: ^1.0.0
-  # Solo para la búsqueda por texto (sin API key). La descarga siempre es yt-dlp.
+  # incluidos en el APK). Descarga video/audio con FFmpeg.
+  # FORK LOCAL (v1.0.9): el extractor 1.0.0 de pub inicializaba yt-dlp en el
+  # HILO PRINCIPAL y eso cerraba la app en el Galaxy A07 al tocar una rola
+  # (log: "iniciando motor yt-dlp"). El fork en packages/extractor es
+  # idéntico salvo que el init corre en Dispatchers.IO. No usar ^1.0.0.
+  extractor:
+    path: packages/extractor
+  # Búsqueda por texto, metadatos y descarga directa (sin motor) con solo HTTP.
   youtube_explode_dart: ^2.5.3
   path_provider: ^2.1.0
   permission_handler: ^11.0.0
