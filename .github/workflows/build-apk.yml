@@ -50,6 +50,29 @@ jobs:
           grep -q "android.intent.action.SEND" android/app/src/main/AndroidManifest.xml
           grep -q "extractNativeLibs" android/app/src/main/AndroidManifest.xml
 
+      - name: Use fixed debug keystore
+        run: |
+          # Every CI runner generates a fresh debug keystore, so each build
+          # had a different signature and Android refused to install the
+          # update over the old app ("App not installed"). Use one fixed
+          # debug keystore (embedded below) so all builds share a signature
+          # and future updates install over the old app. A debug keystore
+          # is not a production secret. AGP's default debug signingConfig
+          # already uses ~/.android/debug.keystore (alias androiddebugkey,
+          # password android), and Liquid YT's build.gradle.kts signs the
+          # release with the debug config, so no Gradle change is needed.
+          mkdir -p ~/.android
+          cat > /tmp/debug.keystore.b64 <<'B64EOF'
+          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
+          B64EOF
+          base64 -d /tmp/debug.keystore.b64 > ~/.android/debug.keystore
+          rm -f /tmp/debug.keystore.b64
+          if [ ! -s ~/.android/debug.keystore ]; then
+            echo "ERROR: decoded debug keystore is empty" >&2
+            exit 1
+          fi
+          echo "Fixed debug keystore installed at ~/.android/debug.keystore"
+
       - name: Pub get
         run: flutter pub get
 
