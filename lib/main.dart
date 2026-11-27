@@ -13,23 +13,134 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'models.dart';
 import 'yt_service.dart';
 
-/// Escribe un error de arranque en Descargas/LiquidYT/crash.log (si se
-/// puede) y, si no, en la carpeta privada de la app. Best effort: nunca tira.
+// ---------------------------------------------------------------------------
+// Registro de errores que SÍ sobrevive a un cierre nativo.
+// ---------------------------------------------------------------------------
+// Por qué el crash.log de la v1.0.6 no existía:
+//  1. Un crash NATIVO (Python/yt-dlp) mata el proceso entero: ningún
+//     handler de Dart (runZonedGuarded, FlutterError, onError) se ejecuta.
+//  2. _writeCrashLog era async y se llamaba con unawaited: si el proceso
+//     muere, el write nunca se descarga (flush) a disco.
+//  3. En Android 13+ la app NO puede escribir directo en
+//     /storage/emulated/0/Download/ sin permiso especial: el write fallaba
+//     en silencio y el fallback caía en la carpeta privada de la app, que
+//     el usuario no puede ver en el explorador.
+// Por eso ahora todo se escribe SÍNCRONO (writeAsStringSync + flush) y en
+// varios lugares: la carpeta de salida conocida, Descargas y la carpeta
+// externa de la app (Android/data/.../files), que sí se puede abrir.
+
+/// Carpeta donde sí se pudo escribir la última vez (la fija _outputDir).
+String? _logDirPath;
+
+/// Escribe [text] en el archivo [name], de forma síncrona y con flush,
+/// probando varias carpetas. Devuelve la ruta donde quedó, o null.
+/// Nunca tira excepciones.
+String? _syncWriteLog(String name, String text, {bool append = true}) {
+  final candidates = <String?>[
+    _logDirPath,
+    '/storage/emulated/0/Download/LiquidYT',
+    '/storage/emulated/0/Android/data/com.linejaque.liquidyt/files',
+  ];
+  for (final base in candidates) {
+    if (base == null || base.isEmpty) continue;
+    try {
+      final dir = Directory(base);
+      dir.createSync(recursive: true);
+      final file = File('${dir.path}/$name');
+      file.writeAsStringSync(
+        text,
+        mode: append ? FileMode.append : FileMode.write,
+        flush: true,
+      );
+      return file.path;
+    } catch (_) {}
+  }
+  return null;
+}
+
+/// Error de Dart: se guarda (síncrono) en crash.log.
 Future<void> _writeCrashLog(String text) async {
   final line = '[${DateTime.now().toIso8601String()}] $text\n';
-  try {
-    final dir = Directory('/storage/emulated/0/Download/LiquidYT');
-    await dir.create(recursive: true);
-    await File('${dir.path}/crash.log')
-        .writeAsString(line, mode: FileMode.append);
-    return;
-  } catch (_) {}
-  try {
-    final docs = await getApplicationDocumentsDirectory();
-    await File('${docs.path}/crash.log')
-        .writeAsString(line, mode: FileMode.append);
-  } catch (_) {}
+  _syncWriteLog('crash.log', line, append: true);
 }
+
+/// Última acción antes de una llamada nativa (init / resolve / download).
+/// Se SOBRESCRIBE cada vez, así si la app muere en esa llamada, el archivo
+/// dice exactamente qué estaba haciendo. Se escribe ANTES de la llamada.
+void _writeLastAction(String action) {
+  final line = '[${DateTime.now().toIso8601String()}] $action\n';
+  _syncWriteLog('last_action.log', line, append: false);
+}
+
+String? _findLogFile(String name) {
+  final candidates = <String?>[
+    _logDirPath,
+    '/storage/emulated/0/Download/LiquidYT',
+    '/storage/emulated/0/Android/data/com.linejaque.liquidyt/files',
+  ];
+  for (final base in candidates) {
+    if (base == null || base.isEmpty) continue;
+    try {
+      final f = File('$base/$name');
+      if (f.existsSync()) return f.path;
+    } catch (_) {}
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Tipografía v1.0.7: tamaños explícitos y modestos. Nada queda al tamaño
+// por defecto del sistema: el usuario reportó letras gigantes, y en este
+// teléfono la escala de fuente del sistema las inflaba.
+// ---------------------------------------------------------------------------
+const _sScreenTitle = TextStyle(
+  fontSize: 26,
+  fontWeight: FontWeight.w800,
+  height: 1.15,
+  color: Colors.white,
+);
+const _sTitle = TextStyle(
+  fontSize: 16,
+  fontWeight: FontWeight.w800,
+  height: 1.3,
+  color: Colors.white,
+);
+const _sSection = TextStyle(
+  fontSize: 15,
+  fontWeight: FontWeight.w700,
+  height: 1.35,
+  color: Colors.white,
+);
+const _sBody = TextStyle(
+  fontSize: 13.5,
+  fontWeight: FontWeight.w500,
+  height: 1.45,
+  color: Colors.white,
+);
+const _sCaption = TextStyle(
+  fontSize: 12,
+  fontWeight: FontWeight.w500,
+  height: 1.4,
+  color: Colors.white70,
+);
+const _sChip = TextStyle(fontSize: 13, fontWeight: FontWeight.w600, height: 1.2);
+const _sButton =
+    TextStyle(fontSize: 14, fontWeight: FontWeight.w700, height: 1.2);
+
+/// Ajuste de glass para que las tarjetas NO se vean lavadas/transparentes:
+/// fondo de respaldo oscuro y opaco, más blur y saturación, luz de borde.
+/// Se usa con useOwnLayer: true para que cada tarjeta aplique su propio
+/// ajuste (en modo agrupado los ajustes por widget se ignoran).
+const _cardGlassSettings = LiquidGlassSettings(
+  blur: 14,
+  frost: 10,
+  saturation: 1.6,
+  glassColor: Color(0x33FFFFFF),
+  backerColor: Color(0xB3141B3D),
+  rimLight: 0.5,
+  rimShade: 0.35,
+  glowIntensity: 0.5,
+);
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -44,7 +155,7 @@ Future<void> main() async {
             child: Text(
               'Algo falló al dibujar la pantalla.\n${details.exception}',
               textAlign: TextAlign.center,
-              style: const TextStyle(color: Colors.white),
+              style: _sBody,
             ),
           ),
         ),
@@ -62,9 +173,6 @@ Future<void> main() async {
   };
 
   // El precache de shaders del glass no debe matar la app si falla.
-  // warmUpMode.never: sin precarga pesada antes del primer frame; los
-  // shaders se cargan bajo demanda al pintar. En un gama baja con GLES
-  // (Galaxy A07) el warm-up pesado puede colgar el arranque.
   bool glassOk = false;
   try {
     await LiquidGlassWidgets.initialize(
@@ -105,6 +213,13 @@ class LiquidYtApp extends StatelessWidget {
     return MaterialApp(
       title: 'Liquid YT',
       debugShowCheckedModeBanner: false,
+      // La escala de fuente del sistema no puede inflar la UI: se limita
+      // entre 0.9x y 1.1x. Esto es lo que hacía gigantes las letras.
+      builder: (context, child) => MediaQuery.withClampedTextScaling(
+        minScaleFactor: 0.9,
+        maxScaleFactor: 1.1,
+        child: child!,
+      ),
       theme: ThemeData(
         brightness: Brightness.dark,
         useMaterial3: true,
@@ -142,9 +257,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   String? _engineError;
   String _engineVersions = '';
   String? _crashLogPath;
+  String? _lastActionPath;
 
   bool _searching = false;
   bool _resolving = false;
+  String? _resolveToken;
+  String? _fetchingRealFormatsUrl;
   List<SearchItem> _results = [];
   ResolvedVideo? _resolved;
   FormatOption _selectedFormat = YtService.presets().first;
@@ -248,10 +366,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     });
     bool ok = false;
     try {
+      // last_action ANTES de la llamada nativa: si el proceso muere aquí,
+      // el archivo dice que estaba iniciando el motor.
+      _writeLastAction('iniciando motor yt-dlp');
       ok = await _yt
           .init()
           .timeout(const Duration(seconds: 60), onTimeout: () => false);
+      _writeLastAction(ok ? 'motor listo' : 'motor falló / timeout');
     } catch (e, st) {
+      _writeLastAction('init motor falló: $e');
       unawaited(_writeCrashLog('init motor falló: $e\n$st'));
       ok = false;
     }
@@ -267,26 +390,33 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         _engineVersions = await _yt.engineVersions();
         if (mounted) setState(() {});
       } catch (_) {}
-      unawaited(_yt.updateEngine());
+      // OJO v1.0.7: ya NO se actualiza yt-dlp automáticamente al iniciar.
+      // En v1.0.6 updateEngine() corría sin await justo antes de resolver,
+      // y reemplazaba los archivos de yt-dlp mientras getVideoInfo los
+      // estaba usando: esa carrera es una causa probable del cierre al
+      // elegir una canción. El yt-dlp incluido en el APK basta.
     }
     return ok;
   }
 
-  /// Si existe un crash.log de un arranque anterior, recordar su ruta
+  /// Si existe un crash.log o last_action.log anterior, recordar su ruta
   /// para mostrarla en la pestaña Descargas.
   Future<void> _checkCrashLog() async {
-    const publicPath = '/storage/emulated/0/Download/LiquidYT/crash.log';
     try {
-      if (await File(publicPath).exists()) {
-        if (mounted) setState(() => _crashLogPath = publicPath);
-        return;
-      }
-    } catch (_) {}
-    try {
-      final docs = await getApplicationDocumentsDirectory();
-      final p = '${docs.path}/crash.log';
-      if (await File(p).exists()) {
-        if (mounted) setState(() => _crashLogPath = p);
+      final crash = _findLogFile('crash.log');
+      final last = _findLogFile('last_action.log');
+      // También buscar en la carpeta privada de documentos (fallback viejo).
+      String? docsCrash;
+      try {
+        final docs = await getApplicationDocumentsDirectory();
+        final p = File('${docs.path}/crash.log');
+        if (await p.exists()) docsCrash = p.path;
+      } catch (_) {}
+      if (mounted) {
+        setState(() {
+          _crashLogPath = crash ?? docsCrash;
+          _lastActionPath = last;
+        });
       }
     } catch (_) {}
   }
@@ -364,6 +494,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Future<void> _refreshOutputDirLabel() async {
     final dir = await _outputDir();
+    _logDirPath = dir.path;
     if (mounted) setState(() => _outputDirLabel = dir.path);
   }
 
@@ -372,6 +503,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final saved =
         DownloadRecord.decodeList(prefs.getString('liquidyt_history') ?? '[]');
     final dir = await _outputDir();
+    _logDirPath = dir.path;
     final onDisk = <DownloadRecord>[];
     try {
       for (final f in dir.listSync()) {
@@ -409,11 +541,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void _snack(String msg) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(msg), behavior: SnackBarBehavior.floating),
+      SnackBar(
+        content: Text(msg, style: _sBody),
+        behavior: SnackBarBehavior.floating,
+      ),
     );
   }
 
   Future<void> _search() async {
+    if (_searching) return;
     final q = _queryController.text.trim();
     if (q.isEmpty) {
       _snack('Escribe algo para buscar o pega un link');
@@ -443,15 +579,42 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _resolveAndShow(String url) async {
-    // El motor se prepara aquí, perezosamente, no en el arranque.
-    final ready = await _ensureEngine();
-    if (!ready) {
+  /// Resolver un video sin depender del código nativo para pintar la
+  /// tarjeta. En v1.0.6 tocar una canción llamaba directo a yt-dlp
+  /// (getVideoInfo, Python nativo) y si ese proceso moría, la app se
+  /// cerraba sin dejar crash.log. Ahora:
+  ///  1. La tarjeta se pinta al instante con metadatos ligeros
+  ///     (youtube_explode, solo HTTP, nada nativo): si viene de la
+  ///     búsqueda ya los tenemos; si es un link, se piden con timeout.
+  ///  2. Los formatos REALES se buscan después, en segundo plano, con
+  ///     timeout: si fallan, la tarjeta se queda con los formatos fijos
+  ///     y la descarga sigue funcionando.
+  Future<void> _resolveAndShow(String url, {SearchItem? fromSearch}) async {
+    if (_resolving) return; // doble toque: no resolver dos veces a la vez
+    final token = DateTime.now().millisecondsSinceEpoch.toString();
+    _resolveToken = token;
+
+    if (fromSearch != null) {
+      // Ya tenemos título/canal/miniatura/duración de la búsqueda.
+      final meta = ResolvedVideo(
+        url: fromSearch.url,
+        title: fromSearch.title,
+        channel: fromSearch.channel,
+        thumbnailUrl: fromSearch.thumbnailUrl,
+        durationSeconds: fromSearch.duration?.inSeconds,
+        formats: const [],
+      );
       if (mounted) {
-        _snack('No se pudo preparar el motor yt-dlp. Inténtalo de nuevo.');
+        setState(() {
+          _resolved = meta;
+          _selectedRealFormat = null;
+          _selectedFormat = YtService.presets().first;
+        });
       }
+      unawaited(_fetchRealFormats(fromSearch.url, token));
       return;
     }
+
     setState(() {
       _resolving = true;
       _resolved = null;
@@ -459,13 +622,64 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _selectedFormat = YtService.presets().first;
     });
     try {
-      final video = await _yt.resolve(url);
-      if (!mounted) return;
-      setState(() => _resolved = video);
-    } catch (e) {
-      if (mounted) _snack('No se pudo leer ese video: $e');
+      _writeLastAction('resolviendo metadatos $url');
+      final meta = await _yt
+          .videoMeta(url)
+          .timeout(const Duration(seconds: 20));
+      if (!mounted || _resolveToken != token) return;
+      setState(() => _resolved = meta);
+      unawaited(_fetchRealFormats(url, token));
+    } catch (e, st) {
+      _writeLastAction('metadatos fallaron $url: $e');
+      await _writeCrashLog('resolve-meta falló $url: $e\n$st');
+      if (mounted) _snack('No se pudo leer ese video. Prueba con otro link.');
     } finally {
       if (mounted) setState(() => _resolving = false);
+    }
+  }
+
+  /// Formatos reales de yt-dlp en segundo plano. Es un bonus, nunca un
+  /// motivo de cierre: cualquier error se registra y la tarjeta se queda
+  /// con los formatos fijos (MP3 / MP4 720p / 480p / 360p).
+  Future<void> _fetchRealFormats(String url, String token) async {
+    if (_fetchingRealFormatsUrl == url) return;
+    _fetchingRealFormatsUrl = url;
+    try {
+      _writeLastAction('buscando formatos reales $url');
+      final ready = await _ensureEngine();
+      if (!ready) {
+        _writeLastAction('motor no listo, sin formatos reales $url');
+        return;
+      }
+      if (!mounted || _resolveToken != token) return;
+      final video = await _yt
+          .resolve(url)
+          .timeout(const Duration(seconds: 30));
+      if (!mounted || _resolveToken != token) return;
+      setState(() {
+        if (_resolved != null && _resolved!.url == url) {
+          _resolved = ResolvedVideo(
+            url: _resolved!.url,
+            title: _resolved!.title,
+            channel: _resolved!.channel,
+            thumbnailUrl: video.thumbnailUrl.isNotEmpty
+                ? video.thumbnailUrl
+                : _resolved!.thumbnailUrl,
+            durationSeconds:
+                _resolved!.durationSeconds ?? video.durationSeconds,
+            viewCount: video.viewCount ?? _resolved!.viewCount,
+            formats: video.formats,
+          );
+        }
+      });
+      _writeLastAction(
+          'formatos reales listos $url (${video.formats.length})');
+    } catch (e, st) {
+      _writeLastAction('formatos reales fallaron $url: $e');
+      await _writeCrashLog('formatos reales fallaron $url: $e\n$st');
+      // La tarjeta se queda con los formatos fijos: descargar sigue ok.
+    } finally {
+      if (_fetchingRealFormatsUrl == url) _fetchingRealFormatsUrl = null;
     }
   }
 
@@ -497,6 +711,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _activeStatus = 'Descargando…';
     });
     try {
+      // last_action ANTES de la llamada nativa de descarga.
+      _writeLastAction(
+          'descargando "${video.title}" formato ${option.id} ${video.url}');
       final result = await _yt.download(
         url: video.url,
         outputDir: dir.path,
@@ -531,7 +748,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         final msg = result.errorMessage ?? 'Descarga fallida';
         _snack(_friendlyError(msg));
       }
-    } catch (e) {
+    } catch (e, st) {
+      _writeLastAction('descarga falló "${video.title}": $e');
+      await _writeCrashLog('descarga falló ${video.url}: $e\n$st');
       if (!mounted) return;
       setState(() {
         _activeProcessId = null;
@@ -544,7 +763,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   String _friendlyError(String raw) {
     final low = raw.toLowerCase();
     if (low.contains('sign in') || low.contains('not a bot')) {
-      return 'YouTube pidió verificación para ese video. Prueba con otro video o actualiza yt-dlp en Ajustes.';
+      return 'YouTube pidió verificación para ese video. Prueba con otro video.';
     }
     if (low.contains('private') || low.contains('unavailable')) {
       return 'Ese video es privado o no está disponible.';
@@ -578,7 +797,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
   }
 
-  // ---------- UI ----------
+  // ---------- UI: estilo iOS 27, aireado, letras modestas ----------
 
   @override
   Widget build(BuildContext context) {
@@ -586,21 +805,25 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       background: Container(
         decoration: const BoxDecoration(
           gradient: LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            stops: [0.0, 0.45, 0.75, 1.0],
             colors: [
-              Color(0xFF0B1026),
-              Color(0xFF1B2A6B),
-              Color(0xFF3B1D5E),
-              Color(0xFF0B1026),
+              Color(0xFF0E1330),
+              Color(0xFF1C2E6E),
+              Color(0xFF3A2060),
+              Color(0xFF0E1330),
             ],
           ),
         ),
       ),
       statusBarStyle: GlassStatusBarStyle.auto,
       appBar: GlassAppBar(
-        title: const Text('Liquid YT'),
+        title: const Text('Liquid YT', style: _sTitle),
       ),
+      // Píldora seleccionada SÓLIDA (azul), no transparente: en iOS 27 la
+      // selección es una píldora con color, no un cristal lavado. El
+      // indicador es lo que marca la sección activa.
       bottomBar: GlassTabBar.bottom(
         selectedIndex: _tabIndex,
         onTabSelected: (i) => setState(() => _tabIndex = i),
@@ -608,24 +831,94 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           GlassTab(icon: Icon(Icons.search), label: 'Buscar'),
           GlassTab(icon: Icon(Icons.download), label: 'Descargas'),
         ],
+        indicatorColor: const Color(0xFF4F7CFF),
+        indicatorSettings: const LiquidGlassSettings(
+          blur: 10,
+          frost: 12,
+          saturation: 1.6,
+          glassColor: Color(0xFF4F7CFF),
+        ),
+        selectedIconColor: Colors.white,
+        unselectedIconColor: Colors.white54,
+        selectedLabelColor: Colors.white,
+        unselectedLabelColor: Colors.white54,
+        selectedLabelStyle:
+            const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+        unselectedLabelStyle:
+            const TextStyle(fontSize: 11, fontWeight: FontWeight.w500),
+        labelFontSize: 11,
+        barHeight: 66,
       ),
       body: _tabIndex == 0 ? _buildSearchTab() : _buildDownloadsTab(),
     );
   }
 
+  /// Tarjeta de cristal con fondo de respaldo oscuro y opaco: así el
+  /// glass se ve con cuerpo y no como un vidrio lavado sobre el fondo.
   Widget _glassCard({required Widget child, EdgeInsets? padding}) {
     return GlassContainer.card(
+      shape: const LiquidRoundedSuperellipse(borderRadius: 24),
+      useOwnLayer: true,
+      settings: _cardGlassSettings,
       child: Padding(
-        padding: padding ?? const EdgeInsets.all(16),
+        padding: padding ?? const EdgeInsets.all(20),
         child: child,
       ),
     );
   }
 
+  /// Chip de formato estilo iOS: el seleccionado es una píldora azul
+  /// sólida con letra blanca; el no seleccionado, cristal tenue.
+  Widget _formatChip({
+    required String label,
+    required bool selected,
+    required VoidCallback onTap,
+  }) {
+    return ChoiceChip(
+      label: Text(label, style: _sChip.copyWith(
+        color: selected ? Colors.white : Colors.white.withValues(alpha: 0.85),
+      )),
+      selected: selected,
+      selectedColor: const Color(0xFF4F7CFF),
+      backgroundColor: Colors.white.withValues(alpha: 0.08),
+      side: BorderSide(
+        color: selected
+            ? Colors.transparent
+            : Colors.white.withValues(alpha: 0.18),
+      ),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(12),
+      ),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      onSelected: (_) => onTap(),
+    );
+  }
+
+  Widget _sectionTitle(String text) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 4, bottom: 10),
+      child: Text(text, style: _sSection),
+    );
+  }
+
   Widget _buildSearchTab() {
     return ListView(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 110),
+      // Más aire: más padding lateral y más espacio entre secciones.
+      padding: const EdgeInsets.fromLTRB(20, 8, 20, 140),
       children: [
+        // Título grande estilo iOS (solo el título de pantalla es grande;
+        // el resto de la letra es modesta: 13-16).
+        const Padding(
+          padding: EdgeInsets.only(left: 4, top: 8, bottom: 4),
+          child: Text('Liquid YT', style: _sScreenTitle),
+        ),
+        const Padding(
+          padding: EdgeInsets.only(left: 4, bottom: 20),
+          child: Text(
+            'Descarga videos y audio de YouTube en tu teléfono',
+            style: _sCaption,
+          ),
+        ),
         _glassCard(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -633,7 +926,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               Row(
                 children: [
                   const Icon(Icons.bolt, color: Colors.cyanAccent, size: 20),
-                  const SizedBox(width: 8),
+                  const SizedBox(width: 10),
                   Expanded(
                     child: Text(
                       _engineBusy
@@ -641,59 +934,69 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                           : _engineReady
                               ? 'Motor listo · descarga en tu teléfono'
                               : 'Motor no listo · se prepara al buscar o descargar',
-                      style: const TextStyle(fontWeight: FontWeight.w600),
+                      style: _sBody.copyWith(fontWeight: FontWeight.w600),
                     ),
                   ),
                 ],
               ),
               if (_engineVersions.isNotEmpty)
                 Padding(
-                  padding: const EdgeInsets.only(top: 4),
-                  child: Text(
-                    _engineVersions,
-                    style: TextStyle(color: Colors.white.withOpacity(0.65)),
-                  ),
+                  padding: const EdgeInsets.only(top: 6),
+                  child: Text(_engineVersions, style: _sCaption),
                 ),
               if (_engineError != null)
                 Padding(
-                  padding: const EdgeInsets.only(top: 4),
-                  child: Text(
-                    _engineError!,
-                    style: const TextStyle(color: Colors.orangeAccent),
-                  ),
+                  padding: const EdgeInsets.only(top: 6),
+                  child: Text(_engineError!,
+                      style: _sBody.copyWith(color: Colors.orangeAccent)),
                 ),
-              const SizedBox(height: 12),
+              const SizedBox(height: 16),
               TextField(
                 controller: _queryController,
                 textInputAction: TextInputAction.search,
                 onSubmitted: (_) => _search(),
+                style: const TextStyle(fontSize: 14, color: Colors.white),
                 decoration: InputDecoration(
                   hintText: 'Busca una rola o pega el link de YouTube',
-                  prefixIcon: const Icon(Icons.search),
+                  hintStyle: const TextStyle(
+                      fontSize: 14, color: Colors.white54),
+                  prefixIcon: const Icon(Icons.search, size: 20),
                   suffixIcon: IconButton(
-                    icon: const Icon(Icons.clear),
+                    icon: const Icon(Icons.clear, size: 20),
                     onPressed: () => _queryController.clear(),
                   ),
                   filled: true,
-                  fillColor: Colors.white.withOpacity(0.10),
+                  fillColor: Colors.white.withValues(alpha: 0.10),
                   border: OutlineInputBorder(
                     borderRadius: BorderRadius.circular(18),
                     borderSide: BorderSide.none,
                   ),
+                  contentPadding:
+                      const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
                 ),
               ),
-              const SizedBox(height: 12),
+              const SizedBox(height: 16),
               SizedBox(
                 width: double.infinity,
                 child: FilledButton.icon(
                   onPressed: _searching ? null : _search,
+                  style: FilledButton.styleFrom(
+                    backgroundColor: const Color(0xFF4F7CFF),
+                    foregroundColor: Colors.white,
+                    textStyle: _sButton,
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                  ),
                   icon: _searching
                       ? const SizedBox(
                           width: 18,
                           height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2),
+                          child: CircularProgressIndicator(
+                              strokeWidth: 2, color: Colors.white),
                         )
-                      : const Icon(Icons.search),
+                      : const Icon(Icons.search, size: 20),
                   label: Text(_searching ? 'Buscando…' : 'Buscar'),
                 ),
               ),
@@ -701,7 +1004,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           ),
         ),
         if (_activeProcessId != null) ...[
-          const SizedBox(height: 12),
+          const SizedBox(height: 20),
           _glassCard(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -710,26 +1013,26 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   _activeTitle,
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(fontWeight: FontWeight.w700),
+                  style: _sTitle.copyWith(fontSize: 15),
                 ),
-                const SizedBox(height: 8),
+                const SizedBox(height: 12),
                 LinearProgressIndicator(
                   value: _progress > 0 ? _progress / 100 : null,
                   borderRadius: BorderRadius.circular(8),
                 ),
-                const SizedBox(height: 8),
+                const SizedBox(height: 10),
                 Row(
                   children: [
                     Expanded(
                       child: Text(
                         '${_progress.toStringAsFixed(0)}% · ${_activeStatus.isNotEmpty ? _activeStatus : 'Descargando'}'
                         '${_etaSeconds > 0 ? ' · ETA ${_etaSeconds}s' : ''}',
-                        style: TextStyle(color: Colors.white.withOpacity(0.7)),
+                        style: _sCaption,
                       ),
                     ),
                     TextButton(
                       onPressed: _cancelDownload,
-                      child: const Text('Cancelar'),
+                      child: const Text('Cancelar', style: _sBody),
                     ),
                   ],
                 ),
@@ -738,20 +1041,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           ),
         ],
         if (_resolving) ...[
-          const SizedBox(height: 16),
+          const SizedBox(height: 20),
           const Center(child: CircularProgressIndicator()),
         ],
         if (_resolved != null) ...[
-          const SizedBox(height: 12),
+          const SizedBox(height: 20),
           _buildResolvedCard(_resolved!),
         ],
         if (_results.isNotEmpty) ...[
-          const SizedBox(height: 12),
-          const Text(
-            'Resultados',
-            style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
-          ),
-          const SizedBox(height: 8),
+          const SizedBox(height: 24),
+          _sectionTitle('Resultados'),
           ..._results.map(_buildResultTile),
         ],
       ],
@@ -759,31 +1058,35 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Widget _buildResultTile(SearchItem item) {
+    final disabled = _resolving;
     return Padding(
-      padding: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.only(bottom: 12),
       child: _glassCard(
-        padding: const EdgeInsets.all(10),
+        padding: const EdgeInsets.all(12),
         child: InkWell(
-          onTap: () => _resolveAndShow(item.url),
-          borderRadius: BorderRadius.circular(16),
+          // Mientras se resuelve otro video, el toque se desactiva:
+          // en v1.0.6 un doble toque lanzaba dos getVideoInfo nativos
+          // a la vez.
+          onTap: disabled ? null : () => _resolveAndShow(item.url, fromSearch: item),
+          borderRadius: BorderRadius.circular(20),
           child: Row(
             children: [
               ClipRRect(
                 borderRadius: BorderRadius.circular(12),
                 child: Image.network(
                   item.thumbnailUrl,
-                  width: 120,
-                  height: 68,
+                  width: 112,
+                  height: 64,
                   fit: BoxFit.cover,
                   errorBuilder: (_, __, ___) => Container(
-                    width: 120,
-                    height: 68,
+                    width: 112,
+                    height: 64,
                     color: Colors.white12,
                     child: const Icon(Icons.play_arrow),
                   ),
                 ),
               ),
-              const SizedBox(width: 12),
+              const SizedBox(width: 14),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -792,20 +1095,22 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                       item.title,
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(fontWeight: FontWeight.w700),
+                      style: _sBody.copyWith(fontWeight: FontWeight.w700),
                     ),
-                    const SizedBox(height: 4),
+                    const SizedBox(height: 5),
                     Text(
                       '${item.channel}${item.durationText.isNotEmpty ? ' · ${item.durationText}' : ''}',
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
-                      style:
-                          TextStyle(color: Colors.white.withOpacity(0.65)),
+                      style: _sCaption,
                     ),
                   ],
                 ),
               ),
-              const Icon(Icons.chevron_right),
+              Icon(
+                Icons.chevron_right,
+                color: disabled ? Colors.white24 : Colors.white54,
+              ),
             ],
           ),
         ),
@@ -828,24 +1133,24 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 child: video.thumbnailUrl.isNotEmpty
                     ? Image.network(
                         video.thumbnailUrl,
-                        width: 120,
-                        height: 68,
+                        width: 112,
+                        height: 64,
                         fit: BoxFit.cover,
                         errorBuilder: (_, __, ___) => Container(
-                          width: 120,
-                          height: 68,
+                          width: 112,
+                          height: 64,
                           color: Colors.white12,
                           child: const Icon(Icons.play_arrow),
                         ),
                       )
                     : Container(
-                        width: 120,
-                        height: 68,
+                        width: 112,
+                        height: 64,
                         color: Colors.white12,
                         child: const Icon(Icons.play_arrow),
                       ),
               ),
-              const SizedBox(width: 12),
+              const SizedBox(width: 14),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -854,33 +1159,31 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                       video.title,
                       maxLines: 3,
                       overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(fontWeight: FontWeight.w800),
+                      style: _sTitle,
                     ),
-                    const SizedBox(height: 4),
+                    const SizedBox(height: 5),
                     Text(
                       '${video.channel}${video.durationText.isNotEmpty ? ' · ${video.durationText}' : ''}',
-                      style:
-                          TextStyle(color: Colors.white.withOpacity(0.65)),
+                      style: _sCaption,
                     ),
                   ],
                 ),
               ),
             ],
           ),
-          const SizedBox(height: 14),
-          const Text('Formato',
-              style: TextStyle(fontWeight: FontWeight.w700)),
-          const SizedBox(height: 8),
+          const SizedBox(height: 18),
+          const Text('Formato', style: _sSection),
+          const SizedBox(height: 10),
           Wrap(
             spacing: 8,
             runSpacing: 8,
             children: YtService.presets().map((f) {
               final isSel =
                   _selectedRealFormat == null && _selectedFormat.id == f.id;
-              return ChoiceChip(
-                label: Text(f.label),
+              return _formatChip(
+                label: f.label,
                 selected: isSel,
-                onSelected: (_) => setState(() {
+                onTap: () => setState(() {
                   _selectedFormat = f;
                   _selectedRealFormat = null;
                 }),
@@ -888,33 +1191,41 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             }).toList(),
           ),
           if (real.isNotEmpty) ...[
-            const SizedBox(height: 12),
-            const Text('Formatos reales del video',
-                style: TextStyle(fontWeight: FontWeight.w700)),
-            const SizedBox(height: 8),
+            const SizedBox(height: 16),
+            const Text('Formatos reales del video', style: _sSection),
+            const SizedBox(height: 10),
             Wrap(
               spacing: 8,
               runSpacing: 8,
               children: real.map((f) {
                 final isSel = _selectedRealFormat?.id == f.id;
-                return ChoiceChip(
-                  label: Text('${f.label} · ${f.detail}'),
+                return _formatChip(
+                  label: '${f.label} · ${f.detail}',
                   selected: isSel,
-                  onSelected: (_) => setState(() {
+                  onTap: () => setState(() {
                     _selectedRealFormat = f;
                   }),
                 );
               }).toList(),
             ),
           ],
-          const SizedBox(height: 14),
+          const SizedBox(height: 18),
           SizedBox(
             width: double.infinity,
             child: FilledButton.icon(
               onPressed: _activeProcessId != null
                   ? null
                   : () => _startDownload(video, selected),
-              icon: const Icon(Icons.download),
+              style: FilledButton.styleFrom(
+                backgroundColor: const Color(0xFF4F7CFF),
+                foregroundColor: Colors.white,
+                textStyle: _sButton,
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(16),
+                ),
+              ),
+              icon: const Icon(Icons.download, size: 20),
               label: Text('Descargar · ${selected.label}'),
             ),
           ),
@@ -925,84 +1236,113 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Widget _buildDownloadsTab() {
     return ListView(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 110),
+      padding: const EdgeInsets.fromLTRB(20, 8, 20, 140),
       children: [
+        const Padding(
+          padding: EdgeInsets.only(left: 4, top: 8, bottom: 4),
+          child: Text('Descargas', style: _sScreenTitle),
+        ),
+        Padding(
+          padding: const EdgeInsets.only(left: 4, bottom: 20),
+          child: Text(
+            _history.isEmpty
+                ? 'Tus archivos descargados aparecen aquí'
+                : '${_history.length} archivo${_history.length == 1 ? '' : 's'} descargado${_history.length == 1 ? '' : 's'}',
+            style: _sCaption,
+          ),
+        ),
         _glassCard(
           child: Row(
             children: [
-              const Icon(Icons.folder, color: Colors.cyanAccent),
-              const SizedBox(width: 10),
+              const Icon(Icons.folder, color: Colors.cyanAccent, size: 22),
+              const SizedBox(width: 12),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text('Carpeta de descargas',
-                        style: TextStyle(fontWeight: FontWeight.w700)),
+                    const Text('Carpeta de descargas', style: _sSection),
+                    const SizedBox(height: 3),
                     Text(
                       _outputDirLabel.isEmpty
                           ? 'Descargas / LiquidYT'
                           : _outputDirLabel,
-                      style:
-                          TextStyle(color: Colors.white.withOpacity(0.65)),
+                      style: _sCaption,
                     ),
                   ],
                 ),
               ),
               IconButton(
-                icon: const Icon(Icons.refresh),
+                icon: const Icon(Icons.refresh, size: 22),
                 onPressed: _loadHistory,
               ),
             ],
           ),
         ),
-        const SizedBox(height: 12),
-        if (_crashLogPath != null)
+        if (_crashLogPath != null || _lastActionPath != null) ...[
+          const SizedBox(height: 20),
           _glassCard(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const Row(
                   children: [
-                    Icon(Icons.warning_amber, color: Colors.orangeAccent),
-                    SizedBox(width: 8),
+                    Icon(Icons.warning_amber,
+                        color: Colors.orangeAccent, size: 20),
+                    SizedBox(width: 10),
                     Expanded(
                       child: Text(
-                        'Se guardó un registro de un error anterior',
-                        style: TextStyle(fontWeight: FontWeight.w700),
+                        'Registro de un error anterior',
+                        style: _sSection,
                       ),
                     ),
                   ],
                 ),
-                const SizedBox(height: 4),
+                const SizedBox(height: 6),
                 Text(
-                  'Si la app se vuelve a cerrar, mándame este archivo:\n$_crashLogPath',
-                  style: TextStyle(color: Colors.white.withOpacity(0.75)),
+                  'Si la app se vuelve a cerrar, mándame estos archivos:',
+                  style: _sBody,
                 ),
+                if (_crashLogPath != null) ...[
+                  const SizedBox(height: 6),
+                  Text('crash.log:\n$_crashLogPath', style: _sCaption),
+                ],
+                if (_lastActionPath != null) ...[
+                  const SizedBox(height: 6),
+                  Text(
+                    'last_action.log (qué estaba haciendo al cerrarse):\n$_lastActionPath',
+                    style: _sCaption,
+                  ),
+                ],
               ],
             ),
           ),
-        if (_crashLogPath != null) const SizedBox(height: 12),
+        ],
+        const SizedBox(height: 20),
         if (_history.isEmpty)
           _glassCard(
             child: const Column(
               children: [
                 Icon(Icons.download_done, size: 40, color: Colors.white54),
-                SizedBox(height: 8),
-                Text('Aún no hay descargas.\nBusca una rola y bájala.',
-                    textAlign: TextAlign.center),
+                SizedBox(height: 10),
+                Text(
+                  'Aún no hay descargas.\nBusca una rola y bájala.',
+                  textAlign: TextAlign.center,
+                  style: _sBody,
+                ),
               ],
             ),
           )
         else
           ..._history.map((r) {
             return Padding(
-              padding: const EdgeInsets.only(bottom: 10),
+              padding: const EdgeInsets.only(bottom: 12),
               child: _glassCard(
-                padding: const EdgeInsets.all(12),
+                padding: const EdgeInsets.all(14),
                 child: Row(
                   children: [
-                    const Icon(Icons.audiotrack, color: Colors.cyanAccent),
-                    const SizedBox(width: 10),
+                    const Icon(Icons.audiotrack,
+                        color: Colors.cyanAccent, size: 22),
+                    const SizedBox(width: 12),
                     Expanded(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1011,23 +1351,24 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                             r.title,
                             maxLines: 2,
                             overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(fontWeight: FontWeight.w700),
+                            style: _sBody.copyWith(
+                                fontWeight: FontWeight.w700),
                           ),
+                          const SizedBox(height: 3),
                           Text(
                             '${r.formatLabel}${_sizeText(r.sizeBytes).isNotEmpty ? ' · ${_sizeText(r.sizeBytes)}' : ''}',
-                            style: TextStyle(
-                                color: Colors.white.withOpacity(0.65)),
+                            style: _sCaption,
                           ),
                         ],
                       ),
                     ),
                     IconButton(
-                      icon: const Icon(Icons.play_arrow),
+                      icon: const Icon(Icons.play_arrow, size: 22),
                       onPressed: () => OpenFile.open(r.path),
                       tooltip: 'Abrir / reproducir',
                     ),
                     IconButton(
-                      icon: const Icon(Icons.delete_outline),
+                      icon: const Icon(Icons.delete_outline, size: 22),
                       onPressed: () => _deleteRecord(r),
                       tooltip: 'Borrar',
                     ),
@@ -1056,16 +1397,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             final real = YtService.realFormats(video);
             return Container(
               decoration: BoxDecoration(
-                color: const Color(0xCC141B3D),
+                color: const Color(0xF2141B3D),
                 borderRadius:
                     const BorderRadius.vertical(top: Radius.circular(28)),
-                border: Border.all(color: Colors.white.withOpacity(0.25)),
+                border: Border.all(
+                    color: Colors.white.withValues(alpha: 0.25)),
               ),
               padding: EdgeInsets.fromLTRB(
-                20,
+                24,
                 12,
-                20,
-                MediaQuery.of(ctx).viewInsets.bottom + 24,
+                24,
+                MediaQuery.of(ctx).viewInsets.bottom + 28,
               ),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
@@ -1081,7 +1423,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                       ),
                     ),
                   ),
-                  const SizedBox(height: 14),
+                  const SizedBox(height: 18),
                   Row(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
@@ -1090,24 +1432,24 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                         child: video.thumbnailUrl.isNotEmpty
                             ? Image.network(
                                 video.thumbnailUrl,
-                                width: 120,
-                                height: 68,
+                                width: 112,
+                                height: 64,
                                 fit: BoxFit.cover,
                                 errorBuilder: (_, __, ___) => Container(
-                                  width: 120,
-                                  height: 68,
+                                  width: 112,
+                                  height: 64,
                                   color: Colors.white12,
                                   child: const Icon(Icons.play_arrow),
                                 ),
                               )
                             : Container(
-                                width: 120,
-                                height: 68,
+                                width: 112,
+                                height: 64,
                                 color: Colors.white12,
                                 child: const Icon(Icons.play_arrow),
                               ),
                       ),
-                      const SizedBox(width: 12),
+                      const SizedBox(width: 14),
                       Expanded(
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
@@ -1116,34 +1458,28 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                               video.title,
                               maxLines: 3,
                               overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                  fontWeight: FontWeight.w800),
+                              style: _sTitle,
                             ),
-                            const SizedBox(height: 4),
-                            Text(
-                              video.channel,
-                              style: TextStyle(
-                                  color: Colors.white.withOpacity(0.65)),
-                            ),
+                            const SizedBox(height: 5),
+                            Text(video.channel, style: _sCaption),
                           ],
                         ),
                       ),
                     ],
                   ),
-                  const SizedBox(height: 16),
-                  const Text('Calidad y formato',
-                      style: TextStyle(fontWeight: FontWeight.w700)),
-                  const SizedBox(height: 8),
+                  const SizedBox(height: 20),
+                  const Text('Calidad y formato', style: _sSection),
+                  const SizedBox(height: 10),
                   Wrap(
                     spacing: 8,
                     runSpacing: 8,
                     children: YtService.presets().map((f) {
                       final isSel =
                           selectedReal == null && selected.id == f.id;
-                      return ChoiceChip(
-                        label: Text(f.label),
+                      return _formatChip(
+                        label: f.label,
                         selected: isSel,
-                        onSelected: (_) => setSheetState(() {
+                        onTap: () => setSheetState(() {
                           selected = f;
                           selectedReal = null;
                         }),
@@ -1151,23 +1487,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     }).toList(),
                   ),
                   if (real.isNotEmpty) ...[
-                    const SizedBox(height: 8),
+                    const SizedBox(height: 10),
                     Wrap(
                       spacing: 8,
                       runSpacing: 8,
                       children: real.map((f) {
                         final isSel = selectedReal?.id == f.id;
-                        return ChoiceChip(
-                          label: Text(f.label),
+                        return _formatChip(
+                          label: f.label,
                           selected: isSel,
-                          onSelected: (_) => setSheetState(() {
+                          onTap: () => setSheetState(() {
                             selectedReal = f;
                           }),
                         );
                       }).toList(),
                     ),
                   ],
-                  const SizedBox(height: 16),
+                  const SizedBox(height: 20),
                   SizedBox(
                     width: double.infinity,
                     child: FilledButton.icon(
@@ -1178,7 +1514,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                               _startDownload(video, current);
                               setState(() => _tabIndex = 0);
                             },
-                      icon: const Icon(Icons.download),
+                      style: FilledButton.styleFrom(
+                        backgroundColor: const Color(0xFF4F7CFF),
+                        foregroundColor: Colors.white,
+                        textStyle: _sButton,
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                      ),
+                      icon: const Icon(Icons.download, size: 20),
                       label: Text('Descargar · ${current.label}'),
                     ),
                   ),
