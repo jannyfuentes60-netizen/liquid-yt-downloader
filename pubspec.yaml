@@ -1,7 +1,7 @@
 name: liquid_yt
 description: "Liquid YT — Descargador de YouTube para Android con estilo iOS 27 Liquid Glass. yt-dlp + FFmpeg en el dispositivo, sin servidor."
 publish_to: "none"
-version: 1.0.1+2002
+version: 1.0.2+2003
 
 environment:
   sdk: ">=3.5.0 <4.0.0"
