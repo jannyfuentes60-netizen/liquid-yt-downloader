@@ -249,9 +249,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   int _tabIndex = 0;
   bool _engineReady = false;
-  // El motor ya NO se inicia en el arranque: se prepara perezosamente al
-  // primer uso (resolver/descargar). Así abrir la app nunca depende de la
-  // extracción pesada de yt-dlp/FFmpeg en el hilo principal.
+  // El motor ya NO se inicia en el arranque ni al tocar una rola: solo
+  // al presionar Descargar en un formato que lo necesita (MP3 / MP4
+  // 720p / 480p). Tocar una canción solo pinta la tarjeta con metadatos
+  // HTTP; el log del usuario lo confirmó: la v1.0.8 moría en
+  // "iniciando motor yt-dlp" justo al tocar la tarjeta, porque
+  // _fetchRealFormats llamaba a _ensureEngine en ese camino.
   bool _engineBusy = false;
   Future<bool>? _engineInitFuture;
   String? _engineError;
@@ -262,11 +265,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   bool _searching = false;
   bool _resolving = false;
   String? _resolveToken;
-  String? _fetchingRealFormatsUrl;
+  String? _fetchingDirectFormatsUrl;
   List<SearchItem> _results = [];
   ResolvedVideo? _resolved;
   FormatOption _selectedFormat = YtService.presets().first;
-  FormatOption? _selectedRealFormat;
+  FormatOption? _selectedDirectFormat;
+  // Formatos de descarga directa (manifiesto HTTP, sin motor) del video
+  // que está en la tarjeta. Llegan en segundo plano; si YouTube no los
+  // da, la lista queda vacía y se usan los formatos fijos con motor.
+  List<FormatOption> _directFormats = [];
 
   String? _activeProcessId;
   String _activeTitle = '';
@@ -343,22 +350,37 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     await _checkSharedText();
   }
 
-  /// Prepara el motor yt-dlp la primera vez que hace falta (resolver o
-  /// descargar). Nunca se llama en el arranque. Una sola inicialización
-  /// en vuelo: los demás esperan el mismo Future. Con timeout para no
-  /// dejar la UI colgada si la extracción nativa se atora.
+  /// Prepara el motor yt-dlp SOLO cuando el usuario presiona Descargar
+  /// en un formato que lo necesita. Nunca se llama al tocar una rola,
+  /// buscar o resolver. Una sola inicialización en vuelo: los demás
+  /// esperan el mismo Future. Con el fork local el init corre en
+  /// segundo plano (ya no en el hilo principal), así que la UI no se
+  /// congela; si falla, reintenta una vez y si vuelve a fallar avisa
+  /// sin cerrar la app.
   Future<bool> _ensureEngine() async {
     if (_engineReady) return true;
     final inFlight = _engineInitFuture;
     if (inFlight != null) return inFlight;
-    final fut = _initEngine();
+    final fut = _initEngineWithRetry();
     _engineInitFuture = fut;
     final ok = await fut;
     if (!ok) _engineInitFuture = null; // permitir reintentar
     return ok;
   }
 
-  Future<bool> _initEngine() async {
+  Future<bool> _initEngineWithRetry() async {
+    for (var attempt = 1; attempt <= 2; attempt++) {
+      final ok = await _initEngine(attempt: attempt);
+      if (ok) return true;
+      if (attempt == 1) {
+        _writeLastAction('init motor intento 1 falló, reintentando en 2 s');
+        await Future.delayed(const Duration(seconds: 2));
+      }
+    }
+    return false;
+  }
+
+  Future<bool> _initEngine({int attempt = 1}) async {
     if (!mounted) return false;
     setState(() {
       _engineBusy = true;
@@ -367,14 +389,18 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     bool ok = false;
     try {
       // last_action ANTES de la llamada nativa: si el proceso muere aquí,
-      // el archivo dice que estaba iniciando el motor.
-      _writeLastAction('iniciando motor yt-dlp');
+      // el archivo dice en qué paso estaba. Con el fork el init corre en
+      // segundo plano, así que esto ya no debería matar la app.
+      _writeLastAction(
+          'iniciando motor yt-dlp (intento $attempt, paso 1: Python)');
       ok = await _yt
           .init()
-          .timeout(const Duration(seconds: 60), onTimeout: () => false);
-      _writeLastAction(ok ? 'motor listo' : 'motor falló / timeout');
+          .timeout(const Duration(seconds: 90), onTimeout: () => false);
+      _writeLastAction(ok
+          ? 'motor listo (yt-dlp + FFmpeg, intento $attempt)'
+          : 'motor falló / timeout (intento $attempt)');
     } catch (e, st) {
-      _writeLastAction('init motor falló: $e');
+      _writeLastAction('init motor falló (intento $attempt): $e');
       unawaited(_writeCrashLog('init motor falló: $e\n$st'));
       ok = false;
     }
@@ -580,15 +606,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   /// Resolver un video sin depender del código nativo para pintar la
-  /// tarjeta. En v1.0.6 tocar una canción llamaba directo a yt-dlp
-  /// (getVideoInfo, Python nativo) y si ese proceso moría, la app se
-  /// cerraba sin dejar crash.log. Ahora:
-  ///  1. La tarjeta se pinta al instante con metadatos ligeros
-  ///     (youtube_explode, solo HTTP, nada nativo): si viene de la
-  ///     búsqueda ya los tenemos; si es un link, se piden con timeout.
-  ///  2. Los formatos REALES se buscan después, en segundo plano, con
-  ///     timeout: si fallan, la tarjeta se queda con los formatos fijos
-  ///     y la descarga sigue funcionando.
+  /// tarjeta NI para los formatos. v1.0.9: tocar una canción SOLO pinta
+  /// la tarjeta con metadatos ligeros (youtube_explode, solo HTTP, nada
+  /// nativo). La v1.0.8 se cerraba al tocar la tarjeta porque
+  /// _fetchRealFormats llamaba a _ensureEngine() en ese camino y el init
+  /// del motor en el hilo principal mataba la app (log del usuario:
+  /// "iniciando motor yt-dlp"). Ese camino ya no existe: los formatos
+  /// "reales" ahora vienen del manifiesto HTTP (_fetchDirectFormats) y
+  /// el motor solo se inicia al presionar Descargar.
   Future<void> _resolveAndShow(String url, {SearchItem? fromSearch}) async {
     if (_resolving) return; // doble toque: no resolver dos veces a la vez
     final token = DateTime.now().millisecondsSinceEpoch.toString();
@@ -607,19 +632,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       if (mounted) {
         setState(() {
           _resolved = meta;
-          _selectedRealFormat = null;
+          _selectedDirectFormat = null;
           _selectedFormat = YtService.presets().first;
+          _directFormats = [];
         });
       }
-      unawaited(_fetchRealFormats(fromSearch.url, token));
+      // Solo HTTP, sin motor: si falla, la tarjeta se queda con los
+      // formatos fijos y la descarga usa el motor al presionar Descargar.
+      unawaited(_fetchDirectFormats(fromSearch.videoId, token));
       return;
     }
 
     setState(() {
       _resolving = true;
       _resolved = null;
-      _selectedRealFormat = null;
+      _selectedDirectFormat = null;
       _selectedFormat = YtService.presets().first;
+      _directFormats = [];
     });
     try {
       _writeLastAction('resolviendo metadatos $url');
@@ -628,7 +657,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           .timeout(const Duration(seconds: 20));
       if (!mounted || _resolveToken != token) return;
       setState(() => _resolved = meta);
-      unawaited(_fetchRealFormats(url, token));
+      final videoId = YtService.videoIdFromUrl(url);
+      if (videoId != null) {
+        unawaited(_fetchDirectFormats(videoId, token));
+      }
     } catch (e, st) {
       _writeLastAction('metadatos fallaron $url: $e');
       await _writeCrashLog('resolve-meta falló $url: $e\n$st');
@@ -638,48 +670,33 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
-  /// Formatos reales de yt-dlp en segundo plano. Es un bonus, nunca un
-  /// motivo de cierre: cualquier error se registra y la tarjeta se queda
-  /// con los formatos fijos (MP3 / MP4 720p / 480p / 360p).
-  Future<void> _fetchRealFormats(String url, String token) async {
-    if (_fetchingRealFormatsUrl == url) return;
-    _fetchingRealFormatsUrl = url;
+  /// Formatos de descarga directa (manifiesto HTTP, sin motor nativo) en
+  /// segundo plano. Es un bonus, nunca un motivo de cierre: si YouTube
+  /// no entrega el manifiesto para esa rola, la lista queda vacía y la
+  /// tarjeta se queda con los formatos fijos (MP3 / MP4 720p / 480p /
+  /// 360p), que usan el motor al presionar Descargar.
+  Future<void> _fetchDirectFormats(String videoId, String token) async {
+    if (_fetchingDirectFormatsUrl == videoId) return;
+    _fetchingDirectFormatsUrl = videoId;
     try {
-      _writeLastAction('buscando formatos reales $url');
-      final ready = await _ensureEngine();
-      if (!ready) {
-        _writeLastAction('motor no listo, sin formatos reales $url');
-        return;
-      }
-      if (!mounted || _resolveToken != token) return;
-      final video = await _yt
-          .resolve(url)
-          .timeout(const Duration(seconds: 30));
+      _writeLastAction('buscando formatos directos (HTTP) $videoId');
+      final formats = await _yt
+          .directFormats(videoId)
+          .timeout(const Duration(seconds: 20));
       if (!mounted || _resolveToken != token) return;
       setState(() {
-        if (_resolved != null && _resolved!.url == url) {
-          _resolved = ResolvedVideo(
-            url: _resolved!.url,
-            title: _resolved!.title,
-            channel: _resolved!.channel,
-            thumbnailUrl: video.thumbnailUrl.isNotEmpty
-                ? video.thumbnailUrl
-                : _resolved!.thumbnailUrl,
-            durationSeconds:
-                _resolved!.durationSeconds ?? video.durationSeconds,
-            viewCount: video.viewCount ?? _resolved!.viewCount,
-            formats: video.formats,
-          );
-        }
+        _directFormats = formats;
       });
       _writeLastAction(
-          'formatos reales listos $url (${video.formats.length})');
+          'formatos directos listos $videoId (${formats.length})');
     } catch (e, st) {
-      _writeLastAction('formatos reales fallaron $url: $e');
-      await _writeCrashLog('formatos reales fallaron $url: $e\n$st');
+      _writeLastAction('formatos directos fallaron $videoId: $e');
+      await _writeCrashLog('formatos directos fallaron $videoId: $e\n$st');
       // La tarjeta se queda con los formatos fijos: descargar sigue ok.
     } finally {
-      if (_fetchingRealFormatsUrl == url) _fetchingRealFormatsUrl = null;
+      if (_fetchingDirectFormatsUrl == videoId) {
+        _fetchingDirectFormatsUrl = null;
+      }
     }
   }
 
@@ -689,17 +706,45 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _openDownloadSheet(_resolved!);
   }
 
+  /// Descargar. Dos caminos:
+  ///  - Formato DIRECTO (directUrl): descarga por HTTP, SIN motor nativo.
+  ///    No puede cerrar la app y no necesita preparar nada.
+  ///  - Formato con motor (MP3 / MP4 720p / 480p): AQUÍ es el único lugar
+  ///    donde se inicia el motor, con la UI ya pintando "Preparando
+  ///    motor…" (se deja pintar un frame antes de llamar al init) y con
+  ///    reintento. Si el init falla, se avisa y la app sigue viva.
   Future<void> _startDownload(ResolvedVideo video, FormatOption option) async {
     if (_activeProcessId != null) {
       _snack('Ya hay una descarga en curso, espera a que termine');
       return;
     }
-    if (!_engineReady) {
-      final ready = await _ensureEngine();
-      if (!ready) {
-        _snack('Motor no listo: no se pudo preparar yt-dlp.');
-        return;
-      }
+    if (option.isDirect) {
+      await _downloadDirect(video, option);
+      return;
+    }
+    // El botón queda en "Preparando motor…" y se deja pintar el frame
+    // antes de llamar al init, para que el usuario vea qué pasa y no
+    // toque la pantalla mientras se prepara el motor. Si el motor ya
+    // estaba listo, no se muestra nada: se descarga directo.
+    final needsPrep = !_engineReady;
+    if (needsPrep) {
+      setState(() {
+        _engineBusy = true;
+        _activeTitle = video.title;
+        _activeStatus = 'Preparando motor…';
+      });
+      await Future.delayed(const Duration(milliseconds: 300));
+    }
+    final ready = await _ensureEngine();
+    if (!mounted) return;
+    if (!ready) {
+      setState(() {
+        _engineBusy = false;
+        _activeStatus = '';
+      });
+      _snack('No se pudo preparar el motor yt-dlp. Prueba con un '
+          'formato de descarga directa (M4A o MP4 360p) o reintenta.');
+      return;
     }
     final dir = await _outputDir();
     final processId = 'dl_${DateTime.now().millisecondsSinceEpoch}';
@@ -760,6 +805,78 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
+  /// Descarga directa por HTTP (sin motor nativo). El nombre del archivo
+  /// se limpia para que sea válido en Android.
+  String _sanitizeFileName(String name) {
+    var clean = name.replaceAll(RegExp(r'[\\/:*?"<>|]'), ' ').trim();
+    clean = clean.replaceAll(RegExp(r'\s+'), ' ');
+    if (clean.isEmpty) clean = 'LiquidYT';
+    if (clean.length > 120) clean = clean.substring(0, 120).trim();
+    return clean;
+  }
+
+  Future<void> _downloadDirect(ResolvedVideo video, FormatOption option) async {
+    final dir = await _outputDir();
+    final processId = 'dl_${DateTime.now().millisecondsSinceEpoch}';
+    final fileName = '${_sanitizeFileName(video.title)}.${option.directExt}';
+    final outputPath = '${dir.path}/$fileName';
+    setState(() {
+      _activeProcessId = processId;
+      _activeTitle = video.title;
+      _progress = 0;
+      _etaSeconds = 0;
+      _activeStatus = 'Descargando directo…';
+    });
+    try {
+      _writeLastAction('descarga directa "${video.title}" ${option.id}');
+      final path = await _yt.downloadHttp(
+        url: option.directUrl!,
+        outputPath: outputPath,
+        onProgress: (received, total) {
+          if (mounted && _activeProcessId == processId && total > 0) {
+            setState(() => _progress = (received / total * 100).clamp(0, 100));
+          }
+        },
+      );
+      if (!mounted) return;
+      int size = 0;
+      try {
+        size = await File(path).length();
+      } catch (_) {}
+      if (size <= 0) throw const HttpException('El archivo quedó vacío');
+      final record = DownloadRecord(
+        title: video.title,
+        url: video.url,
+        path: path,
+        formatLabel: option.label,
+        dateMs: DateTime.now().millisecondsSinceEpoch,
+        sizeBytes: size,
+      );
+      setState(() {
+        _activeProcessId = null;
+        _activeStatus = '';
+        _history = [record, ..._history];
+      });
+      await _saveHistory();
+      _snack('Listo: ${video.title}');
+    } catch (e, st) {
+      _writeLastAction('descarga directa falló "${video.title}": $e');
+      await _writeCrashLog('descarga directa falló ${video.url}: $e\n$st');
+      if (!mounted) return;
+      // Si el usuario la canceló, _activeProcessId ya es null y ya se
+      // avisó "Descarga cancelada": no mostrar otro error encima.
+      final wasActive = _activeProcessId == processId;
+      setState(() {
+        _activeProcessId = null;
+        _activeStatus = '';
+      });
+      if (wasActive) {
+        _snack('La descarga directa falló. Prueba con MP3 o MP4 720p '
+            '(usan el motor).');
+      }
+    }
+  }
+
   String _friendlyError(String raw) {
     final low = raw.toLowerCase();
     if (low.contains('sign in') || low.contains('not a bot')) {
@@ -774,6 +891,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Future<void> _cancelDownload() async {
     final id = _activeProcessId;
     if (id == null) return;
+    // Cancela el motor y también una descarga directa HTTP en curso.
+    _yt.cancelHttp();
     await _yt.cancel(id);
     setState(() {
       _activeProcessId = null;
@@ -930,10 +1049,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   Expanded(
                     child: Text(
                       _engineBusy
-                          ? 'Preparando yt-dlp en tu teléfono…'
+                          ? 'Preparando motor en segundo plano… no cierres la app'
                           : _engineReady
                               ? 'Motor listo · descarga en tu teléfono'
-                              : 'Motor no listo · se prepara al buscar o descargar',
+                              : 'Motor no listo · se prepara solo al descargar',
                       style: _sBody.copyWith(fontWeight: FontWeight.w600),
                     ),
                   ),
@@ -1119,8 +1238,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Widget _buildResolvedCard(ResolvedVideo video) {
-    final real = YtService.realFormats(video);
-    final selected = _selectedRealFormat ?? _selectedFormat;
+    final direct = _directFormats;
+    final selected = _selectedDirectFormat ?? _selectedFormat;
     return _glassCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1179,31 +1298,31 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             runSpacing: 8,
             children: YtService.presets().map((f) {
               final isSel =
-                  _selectedRealFormat == null && _selectedFormat.id == f.id;
+                  _selectedDirectFormat == null && _selectedFormat.id == f.id;
               return _formatChip(
                 label: f.label,
                 selected: isSel,
                 onTap: () => setState(() {
                   _selectedFormat = f;
-                  _selectedRealFormat = null;
+                  _selectedDirectFormat = null;
                 }),
               );
             }).toList(),
           ),
-          if (real.isNotEmpty) ...[
+          if (direct.isNotEmpty) ...[
             const SizedBox(height: 16),
-            const Text('Formatos reales del video', style: _sSection),
+            const Text('Descarga directa · sin motor', style: _sSection),
             const SizedBox(height: 10),
             Wrap(
               spacing: 8,
               runSpacing: 8,
-              children: real.map((f) {
-                final isSel = _selectedRealFormat?.id == f.id;
+              children: direct.map((f) {
+                final isSel = _selectedDirectFormat?.id == f.id;
                 return _formatChip(
-                  label: '${f.label} · ${f.detail}',
+                  label: f.label,
                   selected: isSel,
                   onTap: () => setState(() {
-                    _selectedRealFormat = f;
+                    _selectedDirectFormat = f;
                   }),
                 );
               }).toList(),
@@ -1213,7 +1332,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           SizedBox(
             width: double.infinity,
             child: FilledButton.icon(
-              onPressed: _activeProcessId != null
+              // Mientras se prepara el motor, el botón se desactiva: no
+              // se puede lanzar dos descargas ni dos inits a la vez.
+              onPressed: (_activeProcessId != null || _engineBusy)
                   ? null
                   : () => _startDownload(video, selected),
               style: FilledButton.styleFrom(
@@ -1225,8 +1346,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   borderRadius: BorderRadius.circular(16),
                 ),
               ),
-              icon: const Icon(Icons.download, size: 20),
-              label: Text('Descargar · ${selected.label}'),
+              icon: _engineBusy
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(
+                          strokeWidth: 2, color: Colors.white),
+                    )
+                  : const Icon(Icons.download, size: 20),
+              label: Text(_engineBusy
+                  ? 'Preparando motor…'
+                  : 'Descargar · ${selected.label}'),
             ),
           ),
         ],
@@ -1385,7 +1515,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// selector de calidad/formato y botón de descarga.
   void _openDownloadSheet(ResolvedVideo video) {
     FormatOption selected = YtService.presets().first;
-    FormatOption? selectedReal;
+    FormatOption? selectedDirect;
+    // Los formatos directos se cargaron en segundo plano (HTTP) al
+    // resolver el video; si aún no llegaron, el menú muestra solo los
+    // fijos con motor. Nada nativo corre al abrir este menú.
+    final direct = List<FormatOption>.from(_directFormats);
     showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -1393,8 +1527,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       builder: (sheetContext) {
         return StatefulBuilder(
           builder: (ctx, setSheetState) {
-            final current = selectedReal ?? selected;
-            final real = YtService.realFormats(video);
+            final current = selectedDirect ?? selected;
+            final real = direct;
             return Container(
               decoration: BoxDecoration(
                 color: const Color(0xF2141B3D),
@@ -1475,13 +1609,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     runSpacing: 8,
                     children: YtService.presets().map((f) {
                       final isSel =
-                          selectedReal == null && selected.id == f.id;
+                          selectedDirect == null && selected.id == f.id;
                       return _formatChip(
                         label: f.label,
                         selected: isSel,
                         onTap: () => setSheetState(() {
                           selected = f;
-                          selectedReal = null;
+                          selectedDirect = null;
                         }),
                       );
                     }).toList(),
@@ -1492,12 +1626,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                       spacing: 8,
                       runSpacing: 8,
                       children: real.map((f) {
-                        final isSel = selectedReal?.id == f.id;
+                        final isSel = selectedDirect?.id == f.id;
                         return _formatChip(
                           label: f.label,
                           selected: isSel,
                           onTap: () => setSheetState(() {
-                            selectedReal = f;
+                            selectedDirect = f;
                           }),
                         );
                       }).toList(),
