@@ -1,13 +1,24 @@
+import 'dart:io';
+
 import 'package:extractor/extractor.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
 import 'models.dart';
 
 /// Servicio de YouTube:
-/// - Búsqueda por texto con youtube_explode_dart (sin API key, solo metadatos).
-/// - Resolución de link y descarga con el plugin `extractor`, que corre el
-///   yt-dlp real en el teléfono (youtubedl-android: Python + FFmpeg incluidos
-///   en el APK). Nada se descarga desde un servidor.
+/// - Búsqueda por texto y metadatos con youtube_explode_dart (sin API key,
+///   solo HTTP, nada nativo).
+/// - Descarga DIRECTA por HTTP de los streams del manifiesto (MP4 360p
+///   muxed y audio M4A): no toca el motor nativo, no puede cerrar la app.
+/// - Descarga con el plugin `extractor` (fork local en
+///   packages/extractor: yt-dlp real en el teléfono, Python + FFmpeg
+///   incluidos en el APK) SOLO para MP3 y MP4 720p/480p, y SOLO cuando
+///   el usuario presiona Descargar. Nada nativo corre al tocar una rola.
+///
+/// v1.0.9: se ELIMINÓ resolve() (getVideoInfo nativo). Era lo que mataba
+/// la app: tocar una canción disparaba _fetchRealFormats -> _ensureEngine
+/// -> init del motor en el hilo principal (log del usuario: "iniciando
+/// motor yt-dlp"). Los formatos reales ahora vienen del manifiesto HTTP.
 class YtService {
   final YoutubeDLFlutter _dl = YoutubeDLFlutter.instance;
 
@@ -18,7 +29,10 @@ class YtService {
   Stream<DownloadState> get stateStream => _dl.onStateChanged;
   Stream<DownloadError> get errorStream => _dl.onError;
 
-  /// Inicia yt-dlp + FFmpeg en el dispositivo. Primera vez tarda unos segundos.
+  /// Inicia yt-dlp + FFmpeg en el dispositivo. Con el fork local, la
+  /// extracción pesada corre en Dispatchers.IO (ya no en el hilo
+  /// principal), así que no congela ni cierra la app. Primera vez tarda
+  /// unos segundos porque extrae Python + FFmpeg.
   Future<bool> init() async {
     try {
       final result =
@@ -43,14 +57,6 @@ class YtService {
     }
   }
 
-  Future<void> updateEngine() async {
-    try {
-      await _dl.updateYoutubeDL(channel: UpdateChannel.stable);
-    } catch (_) {
-      // Si no hay internet o GitHub limita, se sigue con el yt-dlp incluido.
-    }
-  }
-
   /// Búsqueda real por texto. Devuelve hasta 10 videos.
   Future<List<SearchItem>> search(String query) async {
     final yt = YoutubeExplode();
@@ -72,43 +78,9 @@ class YtService {
     }
   }
 
-  /// Resuelve un link de YouTube con yt-dlp: título, canal, duración,
-  /// miniatura y la lista REAL de formatos del video.
-  /// OJO: esta llamada corre Python nativo (yt-dlp). Si el proceso nativo
-  /// muere, ningún try/catch de Dart lo atrapa: por eso quien llama debe
-  /// escribir last_action ANTES de llamar y ponerle timeout.
-  Future<ResolvedVideo> resolve(String url) async {
-    final info = await _dl.getVideoInfo(url);
-    final formats = <VideoFormatInfo>[];
-    for (final f in info.formats ?? <VideoFormat?>[]) {
-      if (f == null || f.formatId == null) continue;
-      if (formats.length >= 200) break; // yt-dlp puede traer cientos
-      formats.add(VideoFormatInfo(
-        formatId: f.formatId!,
-        ext: f.ext ?? '',
-        resolution: f.resolution ?? '',
-        height: f.height,
-        vcodec: f.vcodec ?? 'none',
-        acodec: f.acodec ?? 'none',
-        filesize: f.filesize,
-      ));
-    }
-    final title = info.title;
-    return ResolvedVideo(
-      url: url,
-      title: (title != null && title.isNotEmpty) ? title : 'Video de YouTube',
-      channel: info.uploader ?? '',
-      thumbnailUrl: info.thumbnail ?? '',
-      durationSeconds: info.duration,
-      viewCount: info.viewCount,
-      formats: formats,
-    );
-  }
-
   /// Metadatos ligeros de un video SIN yt-dlp: solo HTTP con
   /// youtube_explode. No toca código nativo, así que no puede matar la
-  /// app como getVideoInfo. Sirve para pintar la tarjeta al instante y
-  /// dejar los formatos reales para después (en segundo plano).
+  /// app. Sirve para pintar la tarjeta al instante.
   Future<ResolvedVideo> videoMeta(String url) async {
     final yt = YoutubeExplode();
     try {
@@ -126,6 +98,101 @@ class YtService {
     }
   }
 
+  /// Formatos de descarga DIRECTA (sin motor nativo) sacados del
+  /// manifiesto de streams con solo HTTP. Devuelve [] si YouTube no
+  /// entrega el manifiesto para ese video (pasa con algunas rolas:
+  /// VideoUnavailableException) — en ese caso la tarjeta se queda con
+  /// los formatos fijos y la descarga usa el motor al presionar
+  /// Descargar. Nunca tira: cualquier error devuelve lista vacía.
+  Future<List<FormatOption>> directFormats(String videoId) async {
+    final yt = YoutubeExplode();
+    try {
+      final manifest = await yt.videos.streams.getManifest(videoId);
+      final out = <FormatOption>[];
+      // MP4 muxed (video + audio en un solo archivo, normalmente 360p):
+      // descarga directa, sin FFmpeg ni motor.
+      final muxed = manifest.muxed;
+      if (muxed.isNotEmpty) {
+        final best = muxed.withHighestBitrate();
+        out.add(FormatOption(
+          id: 'direct-mp4',
+          label: 'MP4 · ${best.qualityLabel} · Directa',
+          detail: 'Video + audio, sin motor',
+          formatString: '',
+          audioOnly: false,
+          directUrl: best.url.toString(),
+          directExt: 'mp4',
+        ));
+      }
+      // Audio M4A (AAC, sin convertir): descarga directa, sin motor.
+      final audioMp4 = manifest.audioOnly
+          .where((s) => s.container == StreamContainer.mp4)
+          .toList();
+      if (audioMp4.isNotEmpty) {
+        audioMp4.sort((a, b) => b.bitrate.compareTo(a.bitrate));
+        final best = audioMp4.first;
+        out.add(FormatOption(
+          id: 'direct-m4a',
+          label: 'M4A · Audio · Directa',
+          detail: 'Solo audio, sin motor',
+          formatString: '',
+          audioOnly: true,
+          audioFormat: 'm4a',
+          directUrl: best.url.toString(),
+          directExt: 'm4a',
+        ));
+      }
+      return out;
+    } catch (_) {
+      return const [];
+    } finally {
+      yt.close();
+    }
+  }
+
+  /// Descarga directa por HTTP de una URL de stream (googlevideo).
+  /// Sin código nativo. [onProgress] recibe (recibidos, total).
+  /// Devuelve la ruta del archivo escrito.
+  HttpClient? _httpClient;
+
+  /// Cancela una descarga directa en curso (cierra el cliente HTTP).
+  void cancelHttp() {
+    _httpClient?.close(force: true);
+    _httpClient = null;
+  }
+
+  Future<String> downloadHttp({
+    required String url,
+    required String outputPath,
+    void Function(int received, int total)? onProgress,
+  }) async {
+    final client = HttpClient();
+    _httpClient = client;
+    try {
+      final request = await client.getUrl(Uri.parse(url));
+      final response = await request.close();
+      if (response.statusCode != 200 && response.statusCode != 206) {
+        throw HttpException(
+            'YouTube devolvió HTTP ${response.statusCode} para ese video');
+      }
+      final total = response.contentLength;
+      final file = File(outputPath);
+      final sink = file.openWrite();
+      var received = 0;
+      await for (final chunk in response) {
+        received += chunk.length;
+        sink.add(chunk);
+        if (onProgress != null) onProgress(received, total);
+      }
+      await sink.flush();
+      await sink.close();
+      return file.path;
+    } finally {
+      if (_httpClient == client) _httpClient = null;
+      client.close();
+    }
+  }
+
   /// Saca el ID de 11 caracteres de cualquier link de YouTube.
   static String? videoIdFromUrl(String url) {
     final m = RegExp(
@@ -134,7 +201,9 @@ class YtService {
     return m?.group(1);
   }
 
-  /// Descarga con yt-dlp. [processId] sirve para el progreso y para cancelar.
+  /// Descarga con yt-dlp (motor nativo). Solo se llama DESPUÉS de que
+  /// el motor quedó listo, y solo al presionar Descargar.
+  /// [processId] sirve para el progreso y para cancelar.
   Future<DownloadResult> download({
     required String url,
     required String outputDir,
@@ -158,8 +227,9 @@ class YtService {
 
   Future<bool> cancel(String processId) => _dl.cancelDownload(processId);
 
-  /// Formatos fijos que pide el usuario. yt-dlp elige el mejor stream
-  /// disponible dentro de cada límite (FFmpeg une video + audio en MP4).
+  /// Formatos fijos que usan el motor yt-dlp (al presionar Descargar).
+  /// yt-dlp elige el mejor stream disponible dentro de cada límite
+  /// (FFmpeg une video + audio en MP4 o convierte a MP3).
   static List<FormatOption> presets() => const [
         FormatOption(
           id: 'mp3',
@@ -202,51 +272,6 @@ class YtService {
           audioOnly: false,
         ),
       ];
-
-  /// Opciones armadas con los formatos REALES del video (por ID de yt-dlp).
-  static List<FormatOption> realFormats(ResolvedVideo video) {
-    final out = <FormatOption>[];
-    final seen = <String>{};
-    // Combinados (video + audio en un solo archivo).
-    for (final f in video.formats) {
-      if (!f.hasVideo || !f.hasAudio) continue;
-      final h = f.height;
-      final label = h != null ? 'MP4 · ${h}p' : 'MP4 · ${f.resolution}';
-      final key = '$label-${f.ext}';
-      if (!seen.add(key)) continue;
-      out.add(FormatOption(
-        id: 'real-${f.formatId}',
-        label: label,
-        detail: 'Formato ${f.formatId} · ${f.ext}',
-        formatString: f.formatId,
-        audioOnly: false,
-      ));
-    }
-    // Video solo (se une con el mejor audio vía FFmpeg).
-    for (final f in video.formats) {
-      if (!f.hasVideo || f.hasAudio) continue;
-      final h = f.height;
-      if (h == null) continue;
-      final label = 'MP4 · ${h}p';
-      if (!seen.add('v$h')) continue;
-      out.add(FormatOption(
-        id: 'real-${f.formatId}',
-        label: label,
-        detail: 'Formato ${f.formatId} · ${f.ext} + audio',
-        formatString: '${f.formatId}+bestaudio/best',
-        audioOnly: false,
-      ));
-    }
-    out.sort((a, b) {
-      int h(String s) {
-        final m = RegExp(r'(\d+)p').firstMatch(s);
-        return m == null ? 0 : int.tryParse(m.group(1)!) ?? 0;
-      }
-
-      return h(b.label).compareTo(h(a.label));
-    });
-    return out.take(6).toList();
-  }
 
   /// Extrae el primer link de YouTube de un texto compartido.
   static String? extractYoutubeUrl(String text) {
